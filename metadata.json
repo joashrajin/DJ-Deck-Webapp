@@ -1,0 +1,6 @@
+{
+  "name": "dj",
+  "description": "Browser-native dual-deck virtual DJ console with real-time Web Audio mixing, waveforms, 3-band EQ, crossfading, sampler FX, and track library management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
