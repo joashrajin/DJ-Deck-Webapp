@@ -173,7 +173,7 @@ export function formatRemaining(current: number, duration: number): string {
 
 export interface TrackQueryOptions {
   search: string;
-  crateId: string; // 'all' | 'favorites' | custom crate id
+  crateId: string; // 'all' | 'favorites' | 'imported' | custom crate id
   genre: string; // 'all' | specific genre
   bpmFilter: 'all' | 'under-124' | '124-132' | 'over-132';
   sortField: SortField;
@@ -190,9 +190,13 @@ export function filterAndSortTracks(tracks: Track[], options: TrackQueryOptions)
     if (options.crateId === 'favorites' && !track.favorite) {
       return false;
     }
+    if (options.crateId === 'imported' && track.source !== 'local') {
+      return false;
+    }
     if (
       options.crateId !== 'all' &&
       options.crateId !== 'favorites' &&
+      options.crateId !== 'imported' &&
       !track.crateIds.includes(options.crateId)
     ) {
       return false;
@@ -219,6 +223,8 @@ export function filterAndSortTracks(tracks: Track[], options: TrackQueryOptions)
 
   return [...filtered].sort((a, b) => {
     switch (options.sortField) {
+      case 'addedAt':
+        return (a.addedAt - b.addedAt) * dir;
       case 'bpm':
         return (a.bpm - b.bpm) * dir;
       case 'duration':
@@ -358,3 +364,118 @@ export function estimateBpmFromChannelData(channelData: Float32Array, sampleRate
   while (bpm > 165) bpm /= 2;
   return Math.round(bpm);
 }
+
+/**
+ * Converts platter angular movement (radians over deltaMs) into vinyl scratch
+ * position delta (seconds), playback speed multiplier, and direction.
+ * Uses 33.3 RPM turntable feel (1.8 seconds per full 2π revolution).
+ */
+export function computeScratchStep(
+  deltaRadians: number,
+  deltaMs: number
+): {
+  deltaSec: number;
+  speed: number;
+  direction: 'forward' | 'reverse' | 'hold';
+} {
+  const secPerRev = 1.8;
+  const deltaSec = (deltaRadians / (Math.PI * 2)) * secPerRev;
+  const dtSec = Math.max(0.008, deltaMs / 1000);
+  const rawVelocity = deltaSec / dtSec;
+  const clampedVel = clamp(rawVelocity, -4.2, 4.2);
+
+  if (Math.abs(clampedVel) < 0.08) {
+    return {
+      deltaSec: Number(deltaSec.toFixed(4)),
+      speed: 0,
+      direction: 'hold',
+    };
+  }
+
+  return {
+    deltaSec: Number(deltaSec.toFixed(4)),
+    speed: Number(Math.abs(clampedVel).toFixed(3)),
+    direction: clampedVel > 0 ? 'forward' : 'reverse',
+  };
+}
+
+/**
+ * Maps a forward playhead timestamp into the corresponding offset inside
+ * a time-reversed AudioBuffer.
+ */
+export function computeReversedOffset(forwardPos: number, duration: number): number {
+  if (duration <= 0) return 0;
+  return Number(clamp(duration - forwardPos, 0, Math.max(0, duration - 0.01)).toFixed(4));
+}
+
+/**
+ * Computes smooth angular displacement (radians) on a jog wheel from pointer position
+ * relative to wheel center (rx, ry) and pointer delta (dx, dy) in pixels.
+ * Uses tangential torque projection with a minimum effective radius to avoid angular
+ * spikes near the center hub, and supports intuitive straight up/down baby-scratching
+ * along the platter rim as well as circular rotation.
+ */
+export function computeJogDragRadians(
+  rx: number,
+  ry: number,
+  dx: number,
+  dy: number
+): number {
+  const dist = Math.hypot(rx, ry);
+  if (dist < 18) {
+    // Near the center hub, map horizontal/vertical scrub smoothly without angle flips
+    return clamp((dx - dy) / 56, -0.75, 0.75);
+  }
+  const effectiveR = Math.max(48, dist);
+  // Screen-space clockwise cross product: rx * dy - ry * dx
+  const rawRad = (rx * dy - ry * dx) / (effectiveR * effectiveR);
+  return clamp(rawRad, -0.85, 0.85);
+}
+
+/**
+ * Pure reference step of the critically-damped vinyl scratch spring-damper physics
+ * used by the AudioWorklet, enabling deterministic unit testing of forward/reverse
+ * sweeps and zero-crossing smoothness.
+ */
+export function stepVinylScratchPhysics(
+  posSec: number,
+  targetPosSec: number,
+  velSec: number,
+  dtSec: number,
+  omega: number = 130,
+  zeta: number = 0.96
+): { posSec: number; velSec: number } {
+  const err = targetPosSec - posSec;
+  const accel = omega * omega * err - 2 * zeta * omega * velSec;
+  const nextVel = clamp(velSec + accel * dtSec, -6.5, 6.5);
+  const nextPos = Math.max(0, posSec + nextVel * dtSec);
+  return { posSec: nextPos, velSec: nextVel };
+}
+
+const SUPPORTED_AUDIO_EXT_RE = /\.(mp3|wav|ogg|flac|m4a|aac|webm)$/i;
+
+/**
+ * Checks whether a file name or MIME type corresponds to a browser-decodable audio file
+ * while ignoring hidden macOS/system files (e.g. .DS_Store, ._track.mp3) during folder imports.
+ */
+export function isSupportedAudioFile(file: { name: string; type?: string }): boolean {
+  const baseName = file.name.split('/').pop() ?? file.name;
+  if (!baseName || baseName.startsWith('.')) return false;
+  if (file.type && file.type.startsWith('audio/')) return true;
+  return SUPPORTED_AUDIO_EXT_RE.test(baseName);
+}
+
+/**
+ * Filters a batch of files (such as from a folder import) down to supported audio files
+ * sorted naturally by name.
+ */
+export function filterSupportedAudioFiles<T extends { name: string; type?: string }>(
+  files: Iterable<T>
+): T[] {
+  return Array.from(files)
+    .filter((f) => isSupportedAudioFile(f))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+
+

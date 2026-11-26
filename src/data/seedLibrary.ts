@@ -2,6 +2,7 @@ import type { Crate, SamplerPadInfo, Track } from '../types/dj';
 
 export const DEFAULT_CRATES: Crate[] = [
   { id: 'all', name: 'All Tracks', isSystem: true },
+  { id: 'imported', name: 'Imported', isSystem: true },
   { id: 'favorites', name: 'Favorites', isSystem: true },
   { id: 'warmup', name: 'Club Warmup' },
   { id: 'peak', name: 'Peak Hour' },
@@ -27,7 +28,7 @@ export const SEED_TRACKS: Track[] = [
   {
     id: 'trk-acid-pulse',
     title: 'Substation 303',
-    artist: 'Klangwerk',
+    artist: 'Klangform',
     genre: 'Acid Techno',
     bpm: 132,
     musicalKey: '8A',

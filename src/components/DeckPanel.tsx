@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from 'react';
-import { Pause, Play, RefreshCw, Repeat, RotateCcw } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Pause, Play, RefreshCw, Repeat, RotateCcw, Upload } from 'lucide-react';
 import type { DeckId, DeckState, Track, WaveformBin } from '../types/dj';
 import {
   calculateEffectiveBpm,
@@ -7,6 +7,7 @@ import {
   formatTimecode,
 } from '../utils/djMath';
 import { JogWheel } from './JogWheel';
+import { extractFilesFromDataTransfer } from '../storage/folderDrop';
 
 interface DeckPanelProps {
   deck: DeckState;
@@ -18,12 +19,18 @@ interface DeckPanelProps {
   onSync: () => void;
   onSeek: (timeSec: number) => void;
   onSeekDelta: (deltaSec: number) => void;
+  onScratchStart: () => void;
+  onScratchMove: (deltaRadians: number, deltaMs: number) => void;
+  onScratchEnd: () => void;
+  onToggleVinylMode: () => void;
   onNudge: (factor: number) => void;
   onPitchChange: (pitchPercent: number) => void;
   onTogglePitchRange: () => void;
   onHotCueTrigger: (index: number) => void;
   onHotCueClear: (index: number) => void;
   onToggleLoop: (beats?: number) => void;
+  onDropAudioFiles?: (files: FileList | File[]) => void;
+  persistLocalTracks?: boolean;
 }
 
 const LOOP_OPTIONS = [0.5, 1, 2, 4, 8];
@@ -38,14 +45,22 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
   onSync,
   onSeek,
   onSeekDelta,
+  onScratchStart,
+  onScratchMove,
+  onScratchEnd,
+  onToggleVinylMode,
   onNudge,
   onPitchChange,
   onTogglePitchRange,
   onHotCueTrigger,
   onHotCueClear,
   onToggleLoop,
+  onDropAudioFiles,
+  persistLocalTracks = false,
 }) => {
   const isDeckA = deck.id === 'A';
+  const [isFileDragOver, setIsFileDragOver] = useState(false);
+  const dragDepthRef = useRef(0);
   const overviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const elapsedRef = useRef<HTMLSpanElement | null>(null);
   const remainingRef = useRef<HTMLSpanElement | null>(null);
@@ -126,13 +141,76 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
     ? 'bg-sky-500/20 text-sky-200 border-sky-400/60'
     : 'bg-amber-500/20 text-amber-200 border-amber-400/60';
 
+  const handleDragEnter = (e: React.DragEvent<HTMLElement>) => {
+    if (!onDropAudioFiles || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setIsFileDragOver(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLElement>) => {
+    if (!onDropAudioFiles || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLElement>) => {
+    if (!onDropAudioFiles) return;
+    e.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsFileDragOver(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLElement>) => {
+    if (!onDropAudioFiles) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setIsFileDragOver(false);
+    void extractFilesFromDataTransfer(e.dataTransfer).then((files) => {
+      if (files.length > 0) {
+        onDropAudioFiles(files);
+      }
+    });
+  };
+
   return (
     <section
       aria-label={`Deck ${deck.id}`}
       data-testid={`deck-${deck.id}`}
       data-playing={deck.isPlaying ? 'true' : 'false'}
-      className="flex flex-col justify-between gap-3.5 rounded-lg border border-white/[0.08] bg-[#13171F] p-4"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className={`relative flex flex-col justify-between gap-3.5 rounded-lg border bg-[#13171F] p-4 transition-colors ${
+        isFileDragOver
+          ? isDeckA
+            ? 'border-sky-400 bg-sky-500/[0.06]'
+            : 'border-amber-400 bg-amber-500/[0.06]'
+          : 'border-white/[0.08]'
+      }`}
     >
+      {isFileDragOver && (
+        <div
+          className={`pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed backdrop-blur-[2px] ${
+            isDeckA
+              ? 'border-sky-400 bg-[#0B0D10]/85 text-sky-200'
+              : 'border-amber-400 bg-[#0B0D10]/85 text-amber-200'
+          }`}
+        >
+          <Upload className={`h-6 w-6 ${accentText}`} aria-hidden="true" />
+          <p className="font-display text-sm font-semibold text-white">
+            Drop audio to load Deck {deck.id}
+          </p>
+          <p className="text-xs text-slate-300">
+            {persistLocalTracks
+              ? 'Added to Library & saved locally in this browser'
+              : 'Added to Library for this session only — clears on reload'}
+          </p>
+        </div>
+      )}
       {/* Track Info Header */}
       <div className="flex items-start justify-between gap-3 border-b border-white/[0.06] pb-3">
         <div className="min-w-0 flex-1">
@@ -217,16 +295,33 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
 
       {/* Platter + Tempo Pitch Strip */}
       <div className="flex items-center justify-between gap-4 py-1">
-        <div className="flex-1 flex justify-center">
+        <div className="flex-1 flex flex-col items-center gap-2">
           <JogWheel
             deckId={deck.id}
             isPlaying={deck.isPlaying}
+            vinylMode={deck.vinylMode}
             effectiveBpm={effectiveBpm}
             duration={deck.duration}
             getPosition={getPosition}
+            onScratchStart={onScratchStart}
+            onScratchMove={onScratchMove}
+            onScratchEnd={onScratchEnd}
             onSeekDelta={onSeekDelta}
             onNudge={onNudge}
           />
+          <button
+            type="button"
+            onClick={onToggleVinylMode}
+            aria-label={`Deck ${deck.id} vinyl scratch mode`}
+            aria-pressed={deck.vinylMode}
+            className={`rounded border px-2.5 py-0.5 text-[11px] font-medium transition-colors cursor-pointer ${
+              deck.vinylMode
+                ? accentSoftActive
+                : 'border-white/10 bg-[#0E1118] text-slate-400 hover:border-white/25 hover:text-slate-200'
+            }`}
+          >
+            {deck.vinylMode ? 'Vinyl Scratch: On' : 'Vinyl Scratch: Off (Nudge)'}
+          </button>
         </div>
 
         {/* Pitch / Tempo Fader Column */}

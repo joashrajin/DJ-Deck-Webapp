@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { DeckId } from '../types/dj';
-import { formatTimecode } from '../utils/djMath';
+import { computeJogDragRadians, formatTimecode } from '../utils/djMath';
 
 const SLIPMAT_A = '/src/assets/images/slipmat_deck_a_1795607953746.jpg';
 const SLIPMAT_B = '/src/assets/images/slipmat_deck_b_1795607950856.jpg';
@@ -8,9 +8,13 @@ const SLIPMAT_B = '/src/assets/images/slipmat_deck_b_1795607950856.jpg';
 interface JogWheelProps {
   deckId: DeckId;
   isPlaying: boolean;
+  vinylMode: boolean;
   effectiveBpm: number;
   duration: number;
   getPosition: () => number;
+  onScratchStart: () => void;
+  onScratchMove: (deltaRadians: number, deltaMs: number) => void;
+  onScratchEnd: () => void;
   onSeekDelta: (deltaSec: number) => void;
   onNudge: (factor: number) => void;
 }
@@ -18,9 +22,13 @@ interface JogWheelProps {
 export const JogWheel: React.FC<JogWheelProps> = ({
   deckId,
   isPlaying,
+  vinylMode,
   effectiveBpm,
   duration,
   getPosition,
+  onScratchStart,
+  onScratchMove,
+  onScratchEnd,
   onSeekDelta,
   onNudge,
 }) => {
@@ -28,14 +36,17 @@ export const JogWheel: React.FC<JogWheelProps> = ({
   const progressArcRef = useRef<SVGCircleElement | null>(null);
   const timeTextRef = useRef<HTMLSpanElement | null>(null);
   const [imgError, setImgError] = useState(false);
-  const [isScratching, setIsScratching] = useState(false);
+  const [isGrabbed, setIsGrabbed] = useState(false);
 
-  const lastAngleRef = useRef<number | null>(null);
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const lastMoveTimeRef = useRef<number>(0);
   const isPlayingRef = useRef(isPlaying);
+  const vinylModeRef = useRef(vinylMode);
   const durationRef = useRef(duration);
   const getPosRef = useRef(getPosition);
 
   isPlayingRef.current = isPlaying;
+  vinylModeRef.current = vinylMode;
   durationRef.current = duration;
   getPosRef.current = getPosition;
 
@@ -73,42 +84,62 @@ export const JogWheel: React.FC<JogWheelProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [circumference]);
 
-  const computePointerAngle = (e: React.PointerEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    return Math.atan2(e.clientY - cy, e.clientX - cx);
-  };
-
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.currentTarget.setPointerCapture(e.pointerId);
-    setIsScratching(true);
-    lastAngleRef.current = computePointerAngle(e);
+    setIsGrabbed(true);
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+    lastMoveTimeRef.current = performance.now();
+
+    if (vinylModeRef.current) {
+      onScratchStart();
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!isScratching || lastAngleRef.current === null) return;
-    const angle = computePointerAngle(e);
-    let delta = angle - lastAngleRef.current;
-    if (delta > Math.PI) delta -= Math.PI * 2;
-    if (delta < -Math.PI) delta += Math.PI * 2;
-    lastAngleRef.current = angle;
+    if (!isGrabbed || lastPointerRef.current === null) return;
+    const now = performance.now();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+
+    const dx = e.clientX - lastPointerRef.current.x;
+    const dy = e.clientY - lastPointerRef.current.y;
+    if (dx === 0 && dy === 0) return;
+
+    // Midpoint relative to platter center for accurate tangential torque
+    const rx = (e.clientX + lastPointerRef.current.x) * 0.5 - cx;
+    const ry = (e.clientY + lastPointerRef.current.y) * 0.5 - cy;
+    const delta = computeJogDragRadians(rx, ry, dx, dy);
+
+    const dtMs = Math.max(4, now - lastMoveTimeRef.current);
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+    lastMoveTimeRef.current = now;
+
+    if (vinylModeRef.current) {
+      onScratchMove(delta, dtMs);
+      return;
+    }
 
     if (isPlayingRef.current) {
-      // Nudge tempo smoothly while playing
+      // Nudge tempo smoothly while playing in Nudge mode
       const factor = 1 + Math.max(-0.18, Math.min(0.18, delta * 1.4));
       onNudge(factor);
     } else {
-      // Scrub track position precisely when paused
       onSeekDelta(delta * 1.1);
     }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isScratching) {
+    if (!isGrabbed) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
-      setIsScratching(false);
-      lastAngleRef.current = null;
+    }
+    setIsGrabbed(false);
+    lastPointerRef.current = null;
+
+    if (vinylModeRef.current) {
+      onScratchEnd();
+    } else {
       onNudge(1);
     }
   };
@@ -117,14 +148,21 @@ export const JogWheel: React.FC<JogWheelProps> = ({
     <div className="relative flex items-center justify-center select-none">
       <div
         data-testid={`jogwheel-${deckId}`}
+        data-scratching={isGrabbed && vinylMode ? 'true' : 'false'}
         role="group"
-        aria-label={`Deck ${deckId} jog wheel platter — drag to nudge or scrub`}
+        aria-label={`Deck ${deckId} vinyl jog wheel — drag circularly to ${
+          vinylMode ? 'scratch' : 'nudge tempo'
+        }`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
-        className={`relative h-[184px] w-[184px] xl:h-[214px] xl:w-[214px] rounded-full bg-[#0D1015] border border-white/10 shadow-[inset_0_2px_10px_rgba(0,0,0,0.85),0_8px_24px_rgba(0,0,0,0.65)] flex items-center justify-center touch-none ${
-          isScratching ? 'cursor-grabbing ring-1 ring-white/25' : 'cursor-grab'
+        className={`relative h-[184px] w-[184px] xl:h-[214px] xl:w-[214px] rounded-full bg-[#0D1015] border transition-shadow shadow-[inset_0_2px_10px_rgba(0,0,0,0.85),0_8px_24px_rgba(0,0,0,0.65)] flex items-center justify-center touch-none ${
+          isGrabbed
+            ? isDeckA
+              ? 'cursor-grabbing border-sky-400/70 ring-2 ring-sky-400/30'
+              : 'cursor-grabbing border-amber-400/70 ring-2 ring-amber-400/30'
+            : 'cursor-grab border-white/10'
         }`}
       >
         {/* Outer SVG progress ring */}
@@ -178,7 +216,7 @@ export const JogWheel: React.FC<JogWheelProps> = ({
             />
           )}
 
-          {/* High-contrast white cue marker line on platter rim */}
+          {/* High-contrast cue marker line on platter rim */}
           <div
             className="pointer-events-none absolute top-1.5 left-1/2 -translate-x-1/2 h-5 w-1 rounded-full shadow-sm"
             style={{ backgroundColor: accentStroke }}
@@ -186,11 +224,25 @@ export const JogWheel: React.FC<JogWheelProps> = ({
         </div>
 
         {/* Fixed Center Studio Readout Hub */}
-        <div className="pointer-events-none absolute flex h-[64px] w-[64px] flex-col items-center justify-center rounded-full bg-[#0B0D10]/92 border border-white/15 shadow-inner">
-          <span className="font-mono text-xs font-semibold text-white tabular-nums leading-tight">
-            {effectiveBpm > 0 ? effectiveBpm.toFixed(1) : '--.-'}
-          </span>
-          <span className="text-[9px] font-medium text-slate-400 leading-none mt-0.5">BPM</span>
+        <div className="pointer-events-none absolute flex h-[66px] w-[66px] flex-col items-center justify-center rounded-full bg-[#0B0D10]/94 border border-white/15 shadow-inner">
+          {isGrabbed && vinylMode ? (
+            <span
+              className={`font-mono text-[10px] font-bold tracking-wider ${
+                isDeckA ? 'text-sky-300' : 'text-amber-300'
+              }`}
+            >
+              SCRATCH
+            </span>
+          ) : (
+            <>
+              <span className="font-mono text-xs font-semibold text-white tabular-nums leading-tight">
+                {effectiveBpm > 0 ? effectiveBpm.toFixed(1) : '--.-'}
+              </span>
+              <span className="text-[9px] font-medium text-slate-400 leading-none mt-0.5">
+                BPM
+              </span>
+            </>
+          )}
           <span
             ref={timeTextRef}
             className="font-mono text-[10px] text-slate-300 tabular-nums mt-1 leading-none"

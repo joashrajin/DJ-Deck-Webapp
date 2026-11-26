@@ -11,16 +11,27 @@ import type {
 import {
   calculateCrossfaderGains,
   clamp,
+  computeReversedOffset,
+  computeScratchStep,
   computeWaveformBins,
   estimateBpmFromChannelData,
   mapFilterKnob,
   pitchPercentToRate,
 } from '../utils/djMath';
 import { synthesizeSamplerBuffer, synthesizeTrackBuffer } from './synthTracks';
+import { getVinylScratchWorkletUrl } from './vinylScratchWorklet';
 
 interface DeckAudioChannel {
+  trackId: string | null;
   buffer: AudioBuffer | null;
+  reversedBuffer: AudioBuffer | null;
   source: AudioBufferSourceNode | null;
+  transportGain: GainNode;
+  scratchSource: AudioBufferSourceNode | null;
+  scratchWorklet: AudioWorkletNode | null;
+  workletTrackId: string | null;
+  scratchPresence: BiquadFilterNode;
+  scratchGain: GainNode;
   channelGain: GainNode;
   lowEq: BiquadFilterNode;
   midEq: BiquadFilterNode;
@@ -31,6 +42,14 @@ interface DeckAudioChannel {
   analyser: AnalyserNode;
   analyserData: Uint8Array<ArrayBuffer>;
   isPlaying: boolean;
+  isScratching: boolean;
+  isReleasingScratch: boolean;
+  wasPlayingBeforeScratch: boolean;
+  scratchPos: number;
+  scratchTargetPos: number;
+  scratchVel: number;
+  scratchStopTimer: number | null;
+  transportStopTimer: number | null;
   offsetSec: number;
   startedAtCtxTime: number;
   playbackRate: number;
@@ -60,6 +79,7 @@ export class DjAudioEngine {
 
   // Caches
   private bufferCache = new Map<string, AudioBuffer>();
+  private reversedBufferCache = new Map<string, AudioBuffer>();
   private waveformCache = new Map<string, WaveformBin[]>();
   private samplerCache = new Map<SamplerPadId, AudioBuffer>();
 
@@ -71,6 +91,10 @@ export class DjAudioEngine {
   // Cached mixer state
   private crossfaderPos = 0;
   private crossfaderCurve: CrossfaderCurve = 'smooth';
+
+  // AudioWorklet vinyl scratch engine state
+  private workletLoaded = false;
+  private workletInitPromise: Promise<boolean> | null = null;
 
   private synthHelperCtx: BaseAudioContext | null = null;
 
@@ -95,19 +119,101 @@ export class DjAudioEngine {
       // Hydrate any buffers that were pre-loaded before the user's first gesture
       if (this.decks) {
         if (this.pendingTrackIds.A) {
+          this.decks.A.trackId = this.pendingTrackIds.A;
           this.decks.A.buffer = this.bufferCache.get(this.pendingTrackIds.A) ?? null;
+          this.decks.A.reversedBuffer = this.reversedBufferCache.get(this.pendingTrackIds.A) ?? null;
           this.decks.A.onEndedCallback = this.pendingOnEnded.A;
         }
         if (this.pendingTrackIds.B) {
+          this.decks.B.trackId = this.pendingTrackIds.B;
           this.decks.B.buffer = this.bufferCache.get(this.pendingTrackIds.B) ?? null;
+          this.decks.B.reversedBuffer = this.reversedBufferCache.get(this.pendingTrackIds.B) ?? null;
           this.decks.B.onEndedCallback = this.pendingOnEnded.B;
         }
       }
+      // Eagerly register the vinyl scratch AudioWorklet so scratching is instant
+      void this.initScratchWorklets(this.ctx);
     }
     if (this.ctx.state === 'suspended') {
       void this.ctx.resume();
     }
     return this.ctx;
+  }
+
+  private initScratchWorklets(ctx: AudioContext): Promise<boolean> {
+    if (this.workletLoaded) return Promise.resolve(true);
+    if (this.workletInitPromise) return this.workletInitPromise;
+    if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+      return Promise.resolve(false);
+    }
+
+    this.workletInitPromise = ctx.audioWorklet
+      .addModule(getVinylScratchWorkletUrl())
+      .then(() => {
+        if (!this.decks || this.ctx !== ctx) return false;
+        (['A', 'B'] as DeckId[]).forEach((deckId) => {
+          const deck = this.decks![deckId];
+          const node = new AudioWorkletNode(ctx, 'vinyl-scratch-processor', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+          });
+          node.connect(deck.scratchPresence);
+          node.port.onmessage = (event: MessageEvent) => {
+            const msg = event.data;
+            if (!msg || !this.decks) return;
+            const d = this.decks[deckId];
+            if (msg.type === 'pos' && d.isScratching) {
+              d.scratchPos = msg.posSec;
+              d.scratchVel = msg.velSec;
+              d.offsetSec = msg.posSec;
+            } else if (msg.type === 'releaseComplete') {
+              this.finishScratchRelease(deckId, msg.posSec);
+            }
+          };
+          deck.scratchWorklet = node;
+          this.syncWorkletBuffer(deckId);
+
+          // If the user already touched the platter before addModule finished, engage immediately
+          if (deck.isScratching && !deck.isReleasingScratch) {
+            const now = ctx.currentTime;
+            node.port.postMessage({
+              type: 'touchStart',
+              posSec: deck.scratchPos,
+              initialVel: deck.scratchVel,
+              wasPlaying: deck.wasPlayingBeforeScratch,
+              targetPlaybackRate: deck.playbackRate * deck.nudgeFactor,
+            });
+            node.port.postMessage({
+              type: 'touchMove',
+              targetPosSec: deck.scratchTargetPos,
+            });
+            deck.scratchGain.gain.cancelScheduledValues(now);
+            deck.scratchGain.gain.setValueAtTime(deck.scratchGain.gain.value, now);
+            deck.scratchGain.gain.linearRampToValueAtTime(1.0, now + 0.006);
+          }
+        });
+        this.workletLoaded = true;
+        return true;
+      })
+      .catch(() => false);
+
+    return this.workletInitPromise;
+  }
+
+  private syncWorkletBuffer(deckId: DeckId): void {
+    const deck = this.decks?.[deckId];
+    if (!deck || !deck.scratchWorklet || !deck.buffer || !deck.trackId) return;
+    if (deck.workletTrackId === deck.trackId) return;
+    const left = deck.buffer.getChannelData(0);
+    const right = deck.buffer.numberOfChannels > 1 ? deck.buffer.getChannelData(1) : left;
+    deck.scratchWorklet.port.postMessage({
+      type: 'loadBuffer',
+      left,
+      right,
+      sampleRate: deck.buffer.sampleRate,
+    });
+    deck.workletTrackId = deck.trackId;
   }
 
   private pendingTrackIds: Record<DeckId, string | null> = { A: null, B: null };
@@ -181,6 +287,22 @@ export class DjAudioEngine {
       const channelGain = ctx.createGain();
       channelGain.gain.value = 0.85;
 
+      const transportGain = ctx.createGain();
+      transportGain.gain.value = 1;
+      transportGain.connect(channelGain);
+
+      // Subtle cartridge-style upper-mid presence so vinyl scratches cut cleanly through the mix
+      const scratchPresence = ctx.createBiquadFilter();
+      scratchPresence.type = 'peaking';
+      scratchPresence.frequency.value = 2400;
+      scratchPresence.Q.value = 0.85;
+      scratchPresence.gain.value = 2.2;
+
+      const scratchGain = ctx.createGain();
+      scratchGain.gain.value = 0;
+      scratchPresence.connect(scratchGain);
+      scratchGain.connect(channelGain);
+
       const lowEq = ctx.createBiquadFilter();
       lowEq.type = 'lowshelf';
       lowEq.frequency.value = 250;
@@ -224,8 +346,16 @@ export class DjAudioEngine {
       fxSendGain.connect(this.delayNode!);
 
       return {
+        trackId: null,
         buffer: null,
+        reversedBuffer: null,
         source: null,
+        transportGain,
+        scratchSource: null,
+        scratchWorklet: null,
+        workletTrackId: null,
+        scratchPresence,
+        scratchGain,
         channelGain,
         lowEq,
         midEq,
@@ -236,6 +366,14 @@ export class DjAudioEngine {
         analyser,
         analyserData: new Uint8Array(new ArrayBuffer(analyser.fftSize)),
         isPlaying: false,
+        isScratching: false,
+        isReleasingScratch: false,
+        wasPlayingBeforeScratch: false,
+        scratchPos: 0,
+        scratchTargetPos: 0,
+        scratchVel: 0,
+        scratchStopTimer: null,
+        transportStopTimer: null,
         offsetSec: 0,
         startedAtCtxTime: 0,
         playbackRate: 1,
@@ -296,6 +434,32 @@ export class DjAudioEngine {
     };
   }
 
+  /**
+   * Decodes a locally persisted Blob using OfflineAudioContext so restoring saved
+   * IndexedDB tracks on page load never triggers browser AudioContext autoplay warnings.
+   */
+  public async decodePersistedBlob(
+    trackId: string,
+    blob: Blob
+  ): Promise<{ duration: number; waveform: WaveformBin[] }> {
+    const ctx = this.getSynthContext();
+    const arrayBuffer = await blob.arrayBuffer();
+    const buffer = await ctx.decodeAudioData(arrayBuffer);
+    this.bufferCache.set(trackId, buffer);
+    const waveform = computeWaveformBins(buffer.getChannelData(0), 720);
+    this.waveformCache.set(trackId, waveform);
+    return {
+      duration: buffer.duration,
+      waveform,
+    };
+  }
+
+  public removeTrackBuffer(trackId: string): void {
+    this.bufferCache.delete(trackId);
+    this.reversedBufferCache.delete(trackId);
+    this.waveformCache.delete(trackId);
+  }
+
   public loadTrackToDeck(
     deckId: DeckId,
     trackId: string,
@@ -313,13 +477,21 @@ export class DjAudioEngine {
     if (!buffer) return null;
 
     if (this.decks) {
+      this.cancelScratch(deckId);
       this.stopSource(deckId);
       const deck = this.decks[deckId];
+      deck.trackId = trackId;
       deck.isPlaying = false;
       deck.offsetSec = 0;
+      deck.scratchPos = 0;
+      deck.scratchTargetPos = 0;
+      deck.scratchVel = 0;
       deck.loopActive = false;
       deck.onEndedCallback = onEnded;
       deck.buffer = buffer;
+      deck.reversedBuffer = this.reversedBufferCache.get(trackId) ?? null;
+      deck.workletTrackId = null;
+      this.syncWorkletBuffer(deckId);
     }
 
     let waveform = this.waveformCache.get(trackId);
@@ -364,7 +536,7 @@ export class DjAudioEngine {
       source.loop = false;
     }
 
-    source.connect(deck.channelGain);
+    source.connect(deck.transportGain);
     source.onended = () => {
       if (deck.source === source && deck.isPlaying && !deck.loopActive) {
         deck.isPlaying = false;
@@ -382,9 +554,12 @@ export class DjAudioEngine {
   }
 
   public play(deckId: DeckId): void {
-    this.ensureContext();
+    const ctx = this.ensureContext();
     const deck = this.decks?.[deckId];
     if (!deck || !deck.buffer || deck.isPlaying) return;
+    this.cancelScratch(deckId);
+    deck.transportGain.gain.cancelScheduledValues(ctx.currentTime);
+    deck.transportGain.gain.setValueAtTime(1, ctx.currentTime);
     this.startSourceFromOffset(deckId, deck.offsetSec);
   }
 
@@ -392,6 +567,7 @@ export class DjAudioEngine {
     const deck = this.decks?.[deckId];
     if (!deck) return 0;
     const pos = this.getDeckPosition(deckId);
+    this.cancelScratch(deckId);
     this.stopSource(deckId);
     deck.isPlaying = false;
     deck.offsetSec = pos;
@@ -401,18 +577,284 @@ export class DjAudioEngine {
   public seek(deckId: DeckId, timeSec: number): number {
     const deck = this.decks?.[deckId];
     if (!deck || !deck.buffer) return 0;
+    const wasPlaying = deck.isPlaying || (deck.isScratching && deck.wasPlayingBeforeScratch);
+    this.cancelScratch(deckId);
     const clamped = clamp(timeSec, 0, Math.max(0, deck.buffer.duration - 0.02));
     deck.offsetSec = clamped;
-    if (deck.isPlaying) {
+    if (wasPlaying) {
+      if (this.ctx) {
+        deck.transportGain.gain.cancelScheduledValues(this.ctx.currentTime);
+        deck.transportGain.gain.setValueAtTime(1, this.ctx.currentTime);
+      }
       this.startSourceFromOffset(deckId, clamped);
     }
     return clamped;
+  }
+
+  private getOrCreateReversedBuffer(trackId: string, forward: AudioBuffer): AudioBuffer {
+    const existing = this.reversedBufferCache.get(trackId);
+    if (existing) return existing;
+    const ctx = this.ensureContext();
+    const rev = ctx.createBuffer(forward.numberOfChannels, forward.length, forward.sampleRate);
+    for (let ch = 0; ch < forward.numberOfChannels; ch++) {
+      const src = forward.getChannelData(ch);
+      const dst = rev.getChannelData(ch);
+      const last = src.length - 1;
+      for (let i = 0; i < src.length; i++) {
+        dst[i] = src[last - i];
+      }
+    }
+    this.reversedBufferCache.set(trackId, rev);
+    return rev;
+  }
+
+  private stopScratchSource(deckId: DeckId): void {
+    const deck = this.decks?.[deckId];
+    if (!deck) return;
+    if (deck.scratchStopTimer !== null) {
+      window.clearTimeout(deck.scratchStopTimer);
+      deck.scratchStopTimer = null;
+    }
+    if (deck.scratchSource) {
+      try {
+        deck.scratchSource.stop();
+        deck.scratchSource.disconnect();
+      } catch {
+        // ignore already stopped
+      }
+      deck.scratchSource = null;
+    }
+  }
+
+  private cancelScratch(deckId: DeckId): void {
+    const deck = this.decks?.[deckId];
+    if (!deck) return;
+    if (deck.transportStopTimer !== null) {
+      window.clearTimeout(deck.transportStopTimer);
+      deck.transportStopTimer = null;
+    }
+    this.stopScratchSource(deckId);
+    deck.scratchWorklet?.port.postMessage({ type: 'cancel' });
+    deck.isScratching = false;
+    deck.isReleasingScratch = false;
+    deck.wasPlayingBeforeScratch = false;
+    deck.scratchVel = 0;
+    if (this.ctx) {
+      const now = this.ctx.currentTime;
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setTargetAtTime(0, now, 0.005);
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setTargetAtTime(1, now, 0.005);
+    }
+  }
+
+  private finishScratchRelease(deckId: DeckId, finalPos: number): void {
+    const deck = this.decks?.[deckId];
+    if (!deck || !deck.isScratching || !deck.isReleasingScratch) return;
+
+    const resumePlayback = deck.wasPlayingBeforeScratch && Boolean(deck.buffer);
+    deck.isScratching = false;
+    deck.isReleasingScratch = false;
+    deck.wasPlayingBeforeScratch = false;
+    deck.scratchPos = finalPos;
+    deck.scratchTargetPos = finalPos;
+    deck.scratchVel = 0;
+    deck.offsetSec = finalPos;
+
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+
+    if (resumePlayback) {
+      // Seamless 12ms crossfade back to main transport while worklet holds handoff velocity
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setValueAtTime(0, now);
+      this.startSourceFromOffset(deckId, finalPos);
+      deck.transportGain.gain.linearRampToValueAtTime(1, now + 0.012);
+
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setValueAtTime(deck.scratchGain.gain.value, now);
+      deck.scratchGain.gain.linearRampToValueAtTime(0, now + 0.014);
+    } else {
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setValueAtTime(deck.scratchGain.gain.value, now);
+      deck.scratchGain.gain.linearRampToValueAtTime(0, now + 0.01);
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setValueAtTime(1, now);
+    }
+  }
+
+  public startScratch(deckId: DeckId): void {
+    const ctx = this.ensureContext();
+    const deck = this.decks?.[deckId];
+    if (!deck || !deck.buffer) return;
+
+    if (deck.transportStopTimer !== null) {
+      window.clearTimeout(deck.transportStopTimer);
+      deck.transportStopTimer = null;
+    }
+
+    // Re-grabbing platter during a backspin/spin-up preserves playing state seamlessly
+    const regrabbingDuringRelease = deck.isScratching && deck.isReleasingScratch;
+    const currentPos = regrabbingDuringRelease ? deck.scratchPos : this.getDeckPosition(deckId);
+    const wasPlaying = regrabbingDuringRelease ? deck.wasPlayingBeforeScratch : deck.isPlaying;
+    const initialVel = regrabbingDuringRelease
+      ? deck.scratchVel
+      : deck.isPlaying
+        ? deck.playbackRate * deck.nudgeFactor
+        : 0;
+
+    deck.wasPlayingBeforeScratch = wasPlaying;
+    deck.scratchPos = currentPos;
+    deck.scratchTargetPos = currentPos;
+    deck.scratchVel = initialVel;
+    deck.offsetSec = currentPos;
+    deck.isScratching = true;
+    deck.isReleasingScratch = false;
+
+    const now = ctx.currentTime;
+
+    // Click-free 6ms fade down of normal transport before stopping source node
+    if (deck.source) {
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setValueAtTime(deck.transportGain.gain.value, now);
+      deck.transportGain.gain.linearRampToValueAtTime(0, now + 0.006);
+      deck.transportStopTimer = window.setTimeout(() => {
+        if (this.decks?.[deckId].isScratching) {
+          this.stopSource(deckId);
+        }
+      }, 14);
+    } else {
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setValueAtTime(0, now);
+    }
+
+    if (deck.scratchWorklet) {
+      this.syncWorkletBuffer(deckId);
+      deck.scratchWorklet.port.postMessage({
+        type: 'touchStart',
+        posSec: currentPos,
+        initialVel,
+        wasPlaying,
+        targetPlaybackRate: deck.playbackRate * deck.nudgeFactor,
+      });
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setValueAtTime(deck.scratchGain.gain.value, now);
+      deck.scratchGain.gain.linearRampToValueAtTime(1.0, now + 0.006);
+      return;
+    }
+
+    // Fallback for environments without AudioWorklet
+    if (!deck.reversedBuffer && deck.trackId) {
+      deck.reversedBuffer = this.getOrCreateReversedBuffer(deck.trackId, deck.buffer);
+    }
+    this.stopScratchSource(deckId);
+    deck.scratchGain.gain.cancelScheduledValues(now);
+    deck.scratchGain.gain.setTargetAtTime(0, now, 0.006);
+  }
+
+  public scratchMove(deckId: DeckId, deltaRadians: number, deltaMs: number): number {
+    const ctx = this.ensureContext();
+    const deck = this.decks?.[deckId];
+    if (!deck || !deck.buffer || !deck.isScratching) return 0;
+
+    const dur = deck.buffer.duration;
+    // 33.3 RPM turntable feel: 1.8s per full revolution
+    const deltaSec = (deltaRadians / (Math.PI * 2)) * 1.8;
+    const nextTarget = clamp(deck.scratchTargetPos + deltaSec, 0, Math.max(0, dur - 0.02));
+    deck.scratchTargetPos = nextTarget;
+
+    if (deck.scratchWorklet) {
+      deck.scratchWorklet.port.postMessage({
+        type: 'touchMove',
+        targetPosSec: nextTarget,
+      });
+      return deck.scratchPos;
+    }
+
+    // Graceful fallback if AudioWorklet is unavailable
+    const step = computeScratchStep(deltaRadians, deltaMs);
+    const prevPos = deck.scratchPos;
+    const nextPos = clamp(prevPos + step.deltaSec, 0, Math.max(0, dur - 0.02));
+    deck.scratchPos = nextPos;
+    deck.offsetSec = nextPos;
+
+    this.stopScratchSource(deckId);
+    const now = ctx.currentTime;
+    if (step.direction === 'hold' || step.speed < 0.08) {
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setTargetAtTime(0, now, 0.008);
+      return nextPos;
+    }
+
+    const useReverse = step.direction === 'reverse';
+    const buf = useReverse
+      ? deck.reversedBuffer ?? (deck.trackId ? this.getOrCreateReversedBuffer(deck.trackId, deck.buffer) : deck.buffer)
+      : deck.buffer;
+    const startOffset = useReverse
+      ? computeReversedOffset(prevPos, dur)
+      : clamp(prevPos, 0, Math.max(0, dur - 0.02));
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = clamp(step.speed, 0.15, 4.0);
+    src.connect(deck.scratchPresence);
+    deck.scratchGain.gain.cancelScheduledValues(now);
+    deck.scratchGain.gain.setTargetAtTime(0.95, now, 0.006);
+    try {
+      src.start(0, startOffset, 0.24);
+      deck.scratchSource = src;
+    } catch {
+      src.disconnect();
+    }
+    deck.scratchStopTimer = window.setTimeout(() => {
+      if (!this.ctx || !this.decks) return;
+      const d = this.decks[deckId];
+      d.scratchGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.015);
+      this.stopScratchSource(deckId);
+    }, 95);
+    return nextPos;
+  }
+
+  public endScratch(deckId: DeckId): number {
+    const deck = this.decks?.[deckId];
+    if (!deck || !deck.isScratching) return 0;
+
+    if (deck.scratchWorklet) {
+      deck.isReleasingScratch = true;
+      deck.scratchWorklet.port.postMessage({
+        type: 'touchEnd',
+        wasPlaying: deck.wasPlayingBeforeScratch,
+        targetPlaybackRate: deck.playbackRate * deck.nudgeFactor,
+      });
+      return deck.scratchPos;
+    }
+
+    // Fallback release
+    const finalPos = deck.scratchPos;
+    this.stopScratchSource(deckId);
+    if (this.ctx) {
+      const now = this.ctx.currentTime;
+      deck.scratchGain.gain.cancelScheduledValues(now);
+      deck.scratchGain.gain.setTargetAtTime(0, now, 0.008);
+      deck.transportGain.gain.cancelScheduledValues(now);
+      deck.transportGain.gain.setValueAtTime(1, now);
+    }
+    const shouldResume = deck.wasPlayingBeforeScratch && Boolean(deck.buffer);
+    deck.isScratching = false;
+    deck.isReleasingScratch = false;
+    deck.wasPlayingBeforeScratch = false;
+    deck.offsetSec = finalPos;
+
+    if (shouldResume) {
+      this.startSourceFromOffset(deckId, finalPos);
+    }
+    return finalPos;
   }
 
   public getDeckPosition(deckId: DeckId): number {
     if (!this.ctx || !this.decks) return 0;
     const deck = this.decks[deckId];
     if (!deck.buffer) return 0;
+    if (deck.isScratching) return deck.scratchPos;
     if (!deck.isPlaying) return deck.offsetSec;
 
     const elapsed = (this.ctx.currentTime - deck.startedAtCtxTime) * deck.playbackRate * deck.nudgeFactor;
@@ -599,12 +1041,14 @@ export class DjAudioEngine {
       return { deckA: 0, deckB: 0, masterL: 0, masterR: 0 };
     }
     return {
-      deckA: this.decks.A.isPlaying
-        ? this.computeRmsLevel(this.decks.A.analyser, this.decks.A.analyserData)
-        : 0,
-      deckB: this.decks.B.isPlaying
-        ? this.computeRmsLevel(this.decks.B.analyser, this.decks.B.analyserData)
-        : 0,
+      deckA:
+        this.decks.A.isPlaying || this.decks.A.isScratching
+          ? this.computeRmsLevel(this.decks.A.analyser, this.decks.A.analyserData)
+          : 0,
+      deckB:
+        this.decks.B.isPlaying || this.decks.B.isScratching
+          ? this.computeRmsLevel(this.decks.B.analyser, this.decks.B.analyserData)
+          : 0,
       masterL: this.computeRmsLevel(this.masterAnalyserL, this.masterDataL),
       masterR: this.computeRmsLevel(this.masterAnalyserR, this.masterDataR),
     };

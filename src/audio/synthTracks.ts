@@ -358,25 +358,133 @@ export function synthesizeSamplerBuffer(
   const rand = createRng(999 + padId.length * 37);
 
   if (padId === 'airhorn') {
-    const dur = 0.85;
+    // Classic 3-blast Jamaican dancehall / club DJ airhorn ("BWAH - BWAH - BWAAAAHHH!")
+    const dur = 1.55;
     const len = Math.floor(dur * sampleRate);
     const buf = ctx.createBuffer(2, len, sampleRate);
     const l = buf.getChannelData(0);
     const r = buf.getChannelData(1);
-    const freqs = [440, 554.37, 659.25, 880];
+
+    // Dual-horn dissonant brass cluster (G4 + Bb4 + detuned twin reeds for thick air-beating)
+    const voices = [
+      { baseFreq: 392.0, gain: 0.34, phase: 0 },
+      { baseFreq: 396.2, gain: 0.24, phase: 0.7 },
+      { baseFreq: 466.16, gain: 0.30, phase: 1.4 },
+      { baseFreq: 471.4, gain: 0.20, phase: 2.1 },
+    ];
+
+    // Three classic horn blasts: short, short, long sustained
+    const blasts = [
+      { start: 0.0, end: 0.135 },
+      { start: 0.185, end: 0.32 },
+      { start: 0.37, end: 0.98 },
+    ];
+
+    // Resonant horn-bell bandpass + warm lowpass filter state
+    let bpLow = 0;
+    let bpBand = 0;
+    let bodyLp = 0;
+    let noiseLp = 0;
+
+    const dry = new Float32Array(len);
+
     for (let i = 0; i < len; i++) {
       const t = i / sampleRate;
-      const stutter = t < 0.11 || (t > 0.15 && t < 0.25) || t > 0.29 ? 1 : 0.08;
-      const env = Math.min(1, t * 120) * Math.exp(-Math.max(0, t - 0.3) * 4.5) * stutter;
-      let sum = 0;
-      for (const f of freqs) {
-        const mod = f * (1 + 0.008 * Math.sin(TWO_PI * 22 * t));
-        sum += ((t * mod) % 1) * 2 - 1;
+
+      // Compute smooth blast gate envelope and pneumatic pressure pitch bend
+      let env = 0;
+      let pitchMult = 1.0;
+      let attackBurst = 0;
+
+      for (let b = 0; b < blasts.length; b++) {
+        const bl = blasts[b];
+        if (t >= bl.start && t <= bl.end + 0.055) {
+          const localT = t - bl.start;
+          const durB = bl.end - bl.start;
+          const attack = Math.min(1, localT / 0.014);
+          const release =
+            t <= bl.end ? 1 : Math.max(0, 1 - (t - bl.end) / 0.055);
+          const bEnv = attack * release * release;
+          if (bEnv > env) {
+            env = bEnv;
+            // Realistic air-pressure pitch scoop up on attack + slight sag on long blast
+            const scoop = 1 - 0.065 * Math.exp(-localT * 85);
+            const sag = b === 2 ? 1 - 0.018 * Math.min(1, localT / durB) : 1;
+            const vibrato = 1 + 0.0045 * Math.sin(TWO_PI * 19 * localT);
+            pitchMult = scoop * sag * vibrato;
+            attackBurst = Math.exp(-localT * 55);
+          }
+        }
       }
-      const val = Math.tanh((sum / freqs.length) * 1.8) * env * 0.45;
-      l[i] = val;
-      r[i] = val * 0.98;
+
+      if (env > 0.0005) {
+        let sum = 0;
+        for (let v = 0; v < voices.length; v++) {
+          const voice = voices[v];
+          const f = voice.baseFreq * pitchMult;
+          voice.phase += (TWO_PI * f) / sampleRate;
+          if (voice.phase > TWO_PI) voice.phase -= TWO_PI;
+          const p = voice.phase;
+          // Band-limited brassy reed spectrum (rich odd & even harmonics, zero aliasing)
+          const reed =
+            Math.sin(p) * 1.0 +
+            Math.sin(p * 2) * 0.72 +
+            Math.sin(p * 3) * 0.56 +
+            Math.sin(p * 4) * 0.42 +
+            Math.sin(p * 5) * 0.30 +
+            Math.sin(p * 6) * 0.20 +
+            Math.sin(p * 7) * 0.13 +
+            Math.sin(p * 8) * 0.08;
+          sum += reed * voice.gain;
+        }
+
+        // Compressed-air blast transient hiss
+        const rawNoise = rand();
+        noiseLp = noiseLp * 0.72 + rawNoise * 0.28;
+        const airBlast = (rawNoise - noiseLp) * (0.09 + 0.22 * attackBurst);
+
+        // Asymmetric horn diaphragm saturation
+        const driven = Math.tanh((sum * 0.52 + airBlast) * 2.1 + 0.14 * sum * sum * 0.1);
+
+        // Horn-bell formant peak around ~1.55 kHz (2-pole state-variable bandpass)
+        const fCut = Math.min(0.45, (TWO_PI * 1550) / sampleRate);
+        const damp = 0.62;
+        const hp = driven - bpLow - damp * bpBand;
+        bpBand += fCut * hp;
+        bpLow += fCut * bpBand;
+
+        // Smooth top-end rolloff so it's loud and piercing without digital fizz
+        const shaped = driven * 0.52 + bpBand * 0.78;
+        bodyLp = bodyLp * 0.28 + shaped * 0.72;
+        dry[i] = bodyLp * env;
+      } else {
+        // Decay filter states smoothly between blasts
+        bpBand *= 0.96;
+        bpLow *= 0.96;
+        bodyLp *= 0.94;
+        dry[i] = bodyLp * 0.05;
+      }
     }
+
+    // Add authentic dancehall stereo slapback / sound-system echo tail
+    const delayL1 = Math.floor(0.155 * sampleRate);
+    const delayR1 = Math.floor(0.175 * sampleRate);
+    const delayL2 = Math.floor(0.32 * sampleRate);
+    const delayR2 = Math.floor(0.35 * sampleRate);
+
+    for (let i = 0; i < len; i++) {
+      const d = dry[i];
+      const echoL =
+        (i >= delayL1 ? dry[i - delayL1] * 0.32 : 0) +
+        (i >= delayL2 ? dry[i - delayL2] * 0.14 : 0);
+      const echoR =
+        (i >= delayR1 ? dry[i - delayR1] * 0.30 : 0) +
+        (i >= delayR2 ? dry[i - delayR2] * 0.13 : 0);
+
+      l[i] = Math.tanh((d + echoL) * 1.15) * 0.78;
+      r[i] = Math.tanh((d + echoR) * 1.15) * 0.78;
+    }
+
     return buf;
   }
 

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { CheckCircle2, ChevronDown, Upload, X } from 'lucide-react';
 import { audioEngine } from './audio/AudioEngine';
 import { CenterMixer } from './components/CenterMixer';
 import { DeckPanel } from './components/DeckPanel';
@@ -25,10 +26,30 @@ import {
   calculateSyncPitchPercent,
   clamp,
   computeLoopBounds,
+  filterSupportedAudioFiles,
+  formatDuration,
 } from './utils/djMath';
+import {
+  clearAllPersistedLocalTracks,
+  deletePersistedLocalTrack,
+  isIndexedDbAvailable,
+  loadPersistedLocalTracks,
+  savePersistedLocalTracks,
+  updatePersistedTrackMeta,
+  type StoredLocalTrackRecord,
+} from './storage/localTrackStore';
 
 const STORAGE_CRATES_KEY = 'dj_user_crates_v1';
 const STORAGE_FAVS_KEY = 'dj_favorites_v1';
+const STORAGE_PERSIST_KEY = 'dj_persist_local_audio_v1';
+
+function loadPersistPreference(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_PERSIST_KEY) === 'true' && isIndexedDbAvailable();
+  } catch {
+    return false;
+  }
+}
 
 function createInitialDeck(id: DeckId, track: Track | null): DeckState {
   return {
@@ -63,6 +84,7 @@ function createInitialDeck(id: DeckId, track: Track | null): DeckState {
     loopEnd: 0,
     syncLocked: false,
     keyLock: true,
+    vinylMode: true,
   };
 }
 
@@ -72,6 +94,13 @@ function loadSavedCrates(): Crate[] {
     if (!raw) return DEFAULT_CRATES;
     const parsed = JSON.parse(raw) as Crate[];
     if (!Array.isArray(parsed) || parsed.length < 2) return DEFAULT_CRATES;
+    if (!parsed.some((c) => c.id === 'imported')) {
+      const allIndex = parsed.findIndex((c) => c.id === 'all');
+      const insertAt = allIndex >= 0 ? allIndex + 1 : 0;
+      const migrated = [...parsed];
+      migrated.splice(insertAt, 0, { id: 'imported', name: 'Imported', isSystem: true });
+      return migrated;
+    }
     return parsed;
   } catch {
     return DEFAULT_CRATES;
@@ -101,7 +130,19 @@ export default function App() {
   const [showShortcuts, setShowShortcuts] = useState(false);
 
   const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<{ current: number; total: number } | null>(
+    null
+  );
   const [importError, setImportError] = useState<string | null>(null);
+  const [recentlyImportedIds, setRecentlyImportedIds] = useState<string[]>([]);
+  const [importVersion, setImportVersion] = useState(0);
+  const [importBanner, setImportBanner] = useState<{
+    trackIds: string[];
+    loadedToDeck: DeckId | null;
+  } | null>(null);
+  const [persistLocalTracks, setPersistLocalTracks] = useState<boolean>(loadPersistPreference);
+  const [savedLocalCount, setSavedLocalCount] = useState(0);
+  const [isRestoringSaved, setIsRestoringSaved] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
 
@@ -123,10 +164,27 @@ export default function App() {
   });
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const localBlobsRef = useRef<Map<string, { blob: Blob; fileName: string; mimeType: string }>>(
+    new Map()
+  );
   const autoMixRafRef = useRef<number | null>(null);
 
   const trackA = tracks.find((t) => t.id === deckA.trackId) ?? null;
   const trackB = tracks.find((t) => t.id === deckB.trackId) ?? null;
+
+  // Keep canonical and OpenGraph URL aligned with the active deployment origin
+  useEffect(() => {
+    try {
+      const currentUrl = `${window.location.origin}${window.location.pathname}`;
+      const canonical = document.querySelector<HTMLLinkElement>('link[rel="canonical"]');
+      if (canonical) canonical.href = currentUrl;
+      const ogUrl = document.querySelector<HTMLMetaElement>('meta[property="og:url"]');
+      if (ogUrl) ogUrl.content = currentUrl;
+    } catch {
+      // ignore in non-DOM contexts
+    }
+  }, []);
 
   // Persist user crates & favorites
   useEffect(() => {
@@ -175,6 +233,84 @@ export default function App() {
     }
   }, [setDeckState]);
 
+  // Restore opt-in locally saved IndexedDB tracks on reload (using OfflineAudioContext so zero autoplay warnings)
+  useEffect(() => {
+    if (!persistLocalTracks) return;
+    let cancelled = false;
+
+    const restoreSaved = async () => {
+      setIsRestoringSaved(true);
+      try {
+        const records = await loadPersistedLocalTracks();
+        if (cancelled || records.length === 0) {
+          if (!cancelled) setSavedLocalCount(0);
+          return;
+        }
+
+        const restoredTracks: Track[] = [];
+        const restoredWaveforms: Record<string, WaveformBin[]> = {};
+
+        let firstError: string | null = null;
+        for (const rec of records) {
+          if (cancelled) return;
+          try {
+            const decoded = await audioEngine.decodePersistedBlob(rec.id, rec.blob);
+            localBlobsRef.current.set(rec.id, {
+              blob: rec.blob,
+              fileName: rec.fileName,
+              mimeType: rec.mimeType,
+            });
+            restoredWaveforms[rec.id] = decoded.waveform;
+            restoredTracks.push({
+              id: rec.id,
+              title: rec.title,
+              artist: rec.artist,
+              genre: rec.genre,
+              bpm: rec.bpm,
+              musicalKey: rec.musicalKey,
+              duration: decoded.duration || rec.duration,
+              source: 'local',
+              crateIds: rec.crateIds ?? [],
+              favorite: Boolean(rec.favorite),
+              addedAt: rec.addedAt,
+              accentHex: rec.accentHex || '#38BDF8',
+            });
+          } catch (err) {
+            if (!firstError) {
+              firstError = err instanceof Error ? err.message : String(err);
+            }
+          }
+        }
+
+        if (!cancelled && restoredTracks.length > 0) {
+          setWaveforms((prev) => ({ ...prev, ...restoredWaveforms }));
+          setTracks((prev) => {
+            const existingIds = new Set(prev.map((t) => t.id));
+            const uniqueNew = restoredTracks.filter((t) => !existingIds.has(t.id));
+            return [...uniqueNew, ...prev];
+          });
+          setSavedLocalCount(restoredTracks.length);
+        } else if (!cancelled && records.length > 0 && firstError) {
+          setImportError(`Could not restore saved local tracks: ${firstError}`);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setImportError(`Could not read browser audio storage: ${msg}`);
+        }
+      } finally {
+        if (!cancelled) setIsRestoringSaved(false);
+      }
+    };
+
+    void restoreSaved();
+    return () => {
+      cancelled = true;
+    };
+    // Only run once on initial mount when opt-in preference was enabled in a previous session
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const ensureDeckBufferReady = useCallback(
     (deckId: DeckId, track: Track | null) => {
       if (!track) return false;
@@ -193,11 +329,8 @@ export default function App() {
     [setDeckState]
   );
 
-  const handleLoadDeck = useCallback(
-    (deckId: DeckId, trackId: string) => {
-      const target = tracks.find((t) => t.id === trackId);
-      if (!target) return;
-
+  const applyTrackToDeck = useCallback(
+    (deckId: DeckId, target: Track) => {
       const loaded = audioEngine.loadTrackToDeck(deckId, target.id, target.preset, () => {
         setDeckState(deckId, (prev) => ({ ...prev, isPlaying: false, currentTime: 0 }));
       });
@@ -229,7 +362,16 @@ export default function App() {
 
       audioEngine.setDeckPitch(deckId, 0);
     },
-    [tracks, setDeckState]
+    [setDeckState]
+  );
+
+  const handleLoadDeck = useCallback(
+    (deckId: DeckId, trackId: string) => {
+      const target = tracks.find((t) => t.id === trackId);
+      if (!target) return;
+      applyTrackToDeck(deckId, target);
+    },
+    [tracks, applyTrackToDeck]
   );
 
   const handleTogglePlay = useCallback(
@@ -322,6 +464,44 @@ export default function App() {
       const current = audioEngine.getDeckPosition(deckId);
       const pos = audioEngine.seek(deckId, current + deltaSec);
       setDeckState(deckId, (prev) => ({ ...prev, currentTime: pos }));
+    },
+    [setDeckState]
+  );
+
+  const handleScratchStart = useCallback(
+    (deckId: DeckId) => {
+      const deck = deckId === 'A' ? deckA : deckB;
+      const track = deckId === 'A' ? trackA : trackB;
+      if (!track) return;
+      ensureDeckBufferReady(deckId, track);
+      audioEngine.setDeckVolume(deckId, deck.volume);
+      audioEngine.setDeckEq(deckId, deck.eq);
+      audioEngine.setDeckFilter(deckId, deck.filter);
+      audioEngine.setCrossfader(mixer.crossfader, mixer.crossfaderCurve);
+      audioEngine.setMasterGain(mixer.masterGain);
+      audioEngine.startScratch(deckId);
+    },
+    [deckA, deckB, trackA, trackB, mixer, ensureDeckBufferReady]
+  );
+
+  const handleScratchMove = useCallback(
+    (deckId: DeckId, deltaRadians: number, deltaMs: number) => {
+      audioEngine.scratchMove(deckId, deltaRadians, deltaMs);
+    },
+    []
+  );
+
+  const handleScratchEnd = useCallback(
+    (deckId: DeckId) => {
+      const pos = audioEngine.endScratch(deckId);
+      setDeckState(deckId, (prev) => ({ ...prev, currentTime: pos }));
+    },
+    [setDeckState]
+  );
+
+  const handleToggleVinylMode = useCallback(
+    (deckId: DeckId) => {
+      setDeckState(deckId, (prev) => ({ ...prev, vinylMode: !prev.vinylMode }));
     },
     [setDeckState]
   );
@@ -574,11 +754,21 @@ export default function App() {
   }, [isRecording]);
 
   // Library & Crates Handlers
-  const handleToggleFavorite = useCallback((trackId: string) => {
-    setTracks((prev) =>
-      prev.map((t) => (t.id === trackId ? { ...t, favorite: !t.favorite } : t))
-    );
-  }, []);
+  const handleToggleFavorite = useCallback(
+    (trackId: string) => {
+      setTracks((prev) =>
+        prev.map((t) => {
+          if (t.id !== trackId) return t;
+          const nextFav = !t.favorite;
+          if (t.source === 'local' && persistLocalTracks) {
+            void updatePersistedTrackMeta(trackId, { favorite: nextFav }).catch(() => {});
+          }
+          return { ...t, favorite: nextFav };
+        })
+      );
+    },
+    [persistLocalTracks]
+  );
 
   const handleCreateCrate = useCallback((name: string) => {
     const id = `crate-${Date.now()}`;
@@ -592,72 +782,252 @@ export default function App() {
     );
   }, []);
 
-  const handleToggleTrackCrate = useCallback((trackId: string, crateId: string) => {
-    setTracks((prev) =>
-      prev.map((t) =>
-        t.id === trackId
-          ? {
-              ...t,
-              crateIds: t.crateIds.includes(crateId) ? [crateId] : [crateId, ...t.crateIds],
-            }
-          : t
-      )
-    );
-  }, []);
+  const handleToggleTrackCrate = useCallback(
+    (trackId: string, crateId: string) => {
+      setTracks((prev) =>
+        prev.map((t) => {
+          if (t.id !== trackId) return t;
+          const nextCrates = t.crateIds.includes(crateId) ? [crateId] : [crateId, ...t.crateIds];
+          if (t.source === 'local' && persistLocalTracks) {
+            void updatePersistedTrackMeta(trackId, { crateIds: nextCrates }).catch(() => {});
+          }
+          return { ...t, crateIds: nextCrates };
+        })
+      );
+    },
+    [persistLocalTracks]
+  );
 
-  const handleDeleteTrack = useCallback((trackId: string) => {
-    setTracks((prev) => prev.filter((t) => t.id !== trackId));
-  }, []);
+  const handleDeleteTrack = useCallback(
+    (trackId: string) => {
+      setTracks((prev) => prev.filter((t) => t.id !== trackId));
+      setRecentlyImportedIds((prev) => prev.filter((id) => id !== trackId));
+      setImportBanner((prev) => {
+        if (!prev) return null;
+        const remaining = prev.trackIds.filter((id) => id !== trackId);
+        return remaining.length > 0 ? { ...prev, trackIds: remaining } : null;
+      });
+      localBlobsRef.current.delete(trackId);
+      audioEngine.removeTrackBuffer(trackId);
+      if (persistLocalTracks) {
+        void deletePersistedLocalTrack(trackId)
+          .then(() => {
+            setSavedLocalCount((c) => Math.max(0, c - 1));
+          })
+          .catch(() => {});
+      }
+    },
+    [persistLocalTracks]
+  );
 
-  const handleImportFiles = useCallback(async (fileList: FileList | File[]) => {
-    const files = Array.from(fileList).filter(
-      (f) => f.type.startsWith('audio/') || /\.(mp3|wav|ogg|flac|m4a|aac|webm)$/i.test(f.name)
-    );
-    if (files.length === 0) {
-      setImportError('Please select a valid audio file (MP3, WAV, OGG, FLAC, or M4A).');
+  const handleTogglePersistLocalTracks = useCallback(async () => {
+    if (!isIndexedDbAvailable()) {
+      setImportError('Local browser storage (IndexedDB) is not available in this browser.');
       return;
     }
 
-    setImportError(null);
-    setIsImporting(true);
+    if (!persistLocalTracks) {
+      // Opt IN: persist preference and immediately save any local tracks already imported this session
+      setPersistLocalTracks(true);
+      try {
+        localStorage.setItem(STORAGE_PERSIST_KEY, 'true');
+      } catch {
+        // ignore
+      }
 
-    try {
-      const newTracks: Track[] = [];
-      const newWaveforms: Record<string, WaveformBin[]> = {};
-
-      for (const file of files) {
-        const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        const cleanName = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
-        const parts = cleanName.split(' - ');
-        const artist = parts.length > 1 ? parts[0].trim() : 'Local Audio';
-        const title = parts.length > 1 ? parts.slice(1).join(' - ').trim() : cleanName || 'Untitled Track';
-
-        const decoded = await audioEngine.decodeImportedFile(id, file);
-        newWaveforms[id] = decoded.waveform;
-        newTracks.push({
-          id,
-          title,
-          artist,
-          genre: 'Imported',
-          bpm: decoded.bpm,
-          musicalKey: '--',
-          duration: decoded.duration,
-          source: 'local',
-          crateIds: [],
-          favorite: false,
-          addedAt: Date.now(),
-          accentHex: '#38BDF8',
+      const localTracks = tracks.filter((t) => t.source === 'local');
+      const recordsToSave: StoredLocalTrackRecord[] = [];
+      for (const t of localTracks) {
+        const entry = localBlobsRef.current.get(t.id);
+        if (!entry) continue;
+        recordsToSave.push({
+          id: t.id,
+          title: t.title,
+          artist: t.artist,
+          genre: t.genre,
+          bpm: t.bpm,
+          musicalKey: t.musicalKey,
+          duration: t.duration,
+          crateIds: t.crateIds,
+          favorite: t.favorite,
+          addedAt: t.addedAt,
+          accentHex: t.accentHex,
+          fileName: entry.fileName,
+          mimeType: entry.mimeType,
+          blob: entry.blob,
         });
       }
 
-      setWaveforms((prev) => ({ ...prev, ...newWaveforms }));
-      setTracks((prev) => [...newTracks, ...prev]);
-    } catch {
-      setImportError('Could not decode one of the audio files in this browser.');
-    } finally {
-      setIsImporting(false);
+      if (recordsToSave.length > 0) {
+        try {
+          await savePersistedLocalTracks(recordsToSave);
+          setSavedLocalCount(recordsToSave.length);
+        } catch {
+          setImportError('Could not save imported audio to browser storage (storage quota may be full).');
+        }
+      }
+    } else {
+      // Opt OUT: clear stored copies in IndexedDB while keeping active session tracks loaded in memory
+      setPersistLocalTracks(false);
+      try {
+        localStorage.setItem(STORAGE_PERSIST_KEY, 'false');
+      } catch {
+        // ignore
+      }
+      try {
+        await clearAllPersistedLocalTracks();
+      } catch {
+        // ignore
+      }
+      setSavedLocalCount(0);
     }
+  }, [persistLocalTracks, tracks]);
+
+  const handleClearSavedLocalTracks = useCallback(async () => {
+    setPersistLocalTracks(false);
+    try {
+      localStorage.setItem(STORAGE_PERSIST_KEY, 'false');
+    } catch {
+      // ignore
+    }
+    try {
+      await clearAllPersistedLocalTracks();
+    } catch {
+      // ignore
+    }
+    setSavedLocalCount(0);
   }, []);
+
+  const handleImportFiles = useCallback(
+    async (fileList: FileList | File[], targetDeckId?: DeckId) => {
+      const files = filterSupportedAudioFiles(fileList);
+      if (files.length === 0) {
+        setImportError('No supported audio files found (MP3, WAV, OGG, FLAC, M4A, AAC, or WebM).');
+        return;
+      }
+
+      setImportError(null);
+      setIsImporting(true);
+      setImportProgress({ current: 0, total: files.length });
+
+      try {
+        const newTracks: Track[] = [];
+        const newWaveforms: Record<string, WaveformBin[]> = {};
+        const recordsToPersist: StoredLocalTrackRecord[] = [];
+        const baseTimestamp = Date.now();
+        let failedCount = 0;
+
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          setImportProgress({ current: i + 1, total: files.length });
+
+          const id = `local-${baseTimestamp}-${i}-${Math.random().toString(36).slice(2, 7)}`;
+          const rawBase = file.name.replace(/\.[^.]+$/, '').trim();
+          const parts = rawBase.split(/\s+-\s+/);
+          const artist =
+            parts.length > 1
+              ? parts[0].replace(/[_-]+/g, ' ').trim() || 'Local Audio'
+              : 'Local Audio';
+          const title =
+            parts.length > 1
+              ? parts.slice(1).join(' - ').replace(/[_]+/g, ' ').trim() || 'Untitled Track'
+              : rawBase.replace(/[_-]+/g, ' ').trim() || 'Untitled Track';
+
+          try {
+            const rawBytes = await file.arrayBuffer();
+            const mimeType = file.type || 'audio/mpeg';
+            const standaloneBlob = new Blob([rawBytes], { type: mimeType });
+            const decoded = await audioEngine.decodeImportedFile(id, file);
+            newWaveforms[id] = decoded.waveform;
+            const addedAt = baseTimestamp + i;
+            const track: Track = {
+              id,
+              title,
+              artist,
+              genre: 'Imported',
+              bpm: decoded.bpm,
+              musicalKey: '--',
+              duration: decoded.duration,
+              source: 'local',
+              crateIds: [],
+              favorite: false,
+              addedAt,
+              accentHex: '#38BDF8',
+            };
+            newTracks.push(track);
+            localBlobsRef.current.set(id, {
+              blob: standaloneBlob,
+              fileName: file.name,
+              mimeType,
+            });
+
+            if (persistLocalTracks) {
+              recordsToPersist.push({
+                id: track.id,
+                title: track.title,
+                artist: track.artist,
+                genre: track.genre,
+                bpm: track.bpm,
+                musicalKey: track.musicalKey,
+                duration: track.duration,
+                crateIds: [],
+                favorite: false,
+                addedAt,
+                accentHex: track.accentHex,
+                fileName: file.name,
+                mimeType,
+                blob: standaloneBlob,
+              });
+            }
+          } catch {
+            failedCount++;
+          }
+        }
+
+        if (newTracks.length === 0) {
+          setImportError('Could not decode the selected audio files in this browser.');
+          return;
+        }
+
+        if (failedCount > 0) {
+          setImportError(
+            `Imported ${newTracks.length} ${newTracks.length === 1 ? 'track' : 'tracks'}, but ${failedCount} could not be decoded in this browser.`
+          );
+        }
+
+        setWaveforms((prev) => ({ ...prev, ...newWaveforms }));
+        setTracks((prev) => [...newTracks, ...prev]);
+
+        if (persistLocalTracks && recordsToPersist.length > 0) {
+          try {
+            await savePersistedLocalTracks(recordsToPersist);
+            setSavedLocalCount((prev) => prev + recordsToPersist.length);
+          } catch {
+            setImportError(
+              'Tracks imported for this session, but browser storage quota prevented saving them across reloads.'
+            );
+          }
+        }
+
+        const primaryTrack = newTracks[newTracks.length - 1];
+        if (targetDeckId && primaryTrack) {
+          applyTrackToDeck(targetDeckId, primaryTrack);
+        }
+
+        const newIds = newTracks.map((t) => t.id);
+        setRecentlyImportedIds(newIds);
+        setImportVersion((v) => v + 1);
+        setImportBanner({
+          trackIds: newIds,
+          loadedToDeck: targetDeckId ?? null,
+        });
+      } finally {
+        setIsImporting(false);
+        setImportProgress(null);
+      }
+    },
+    [applyTrackToDeck, persistLocalTracks]
+  );
 
   // Keyboard performance shortcuts
   useEffect(() => {
@@ -737,23 +1107,180 @@ export default function App() {
         className="sr-only"
         aria-label="Import local audio files"
         onChange={(e) => {
-          if (e.target.files) {
-            void handleImportFiles(e.target.files);
+          if (e.target.files && e.target.files.length > 0) {
+            const picked = Array.from(e.target.files);
             e.target.value = '';
+            void handleImportFiles(picked);
+          }
+        }}
+      />
+
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        className="sr-only"
+        aria-label="Import local audio folder"
+        {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            const picked = Array.from(e.target.files);
+            e.target.value = '';
+            void handleImportFiles(picked);
           }
         }}
       />
 
       <TopBar
         showSamplerFx={showSamplerFx}
+        persistLocalTracks={persistLocalTracks}
         onToggleSamplerFx={() => setShowSamplerFx((v) => !v)}
         onScrollToConsole={() => scrollToSection('console')}
         onScrollToLibrary={() => scrollToSection('library')}
         onOpenShortcuts={() => setShowShortcuts(true)}
         onTriggerImport={() => fileInputRef.current?.click()}
+        onTriggerImportFolder={() => folderInputRef.current?.click()}
+        onTogglePersistLocalTracks={() => void handleTogglePersistLocalTracks()}
       />
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 px-4 py-4 sm:px-6">
+        {/* Immediate Top-of-Console Import Status & Quick-Load Banner */}
+        {isImporting && (
+          <div
+            role="status"
+            aria-live="polite"
+            data-testid="import-status-banner"
+            className="flex items-center gap-3 rounded-lg border border-sky-400/35 bg-sky-500/10 px-4 py-2.5 text-xs text-sky-100"
+          >
+            <Upload className="h-4 w-4 shrink-0 text-sky-400 animate-pulse" aria-hidden="true" />
+            <span>
+              {importProgress && importProgress.total > 1
+                ? `Importing folder/batch: decoding track ${importProgress.current} of ${importProgress.total}...`
+                : 'Decoding audio locally and analyzing BPM & waveform...'}
+            </span>
+          </div>
+        )}
+
+        {importError && !isImporting && (
+          <div
+            role="alert"
+            data-testid="import-error-banner"
+            className="flex items-center justify-between gap-3 rounded-lg border border-red-500/35 bg-red-500/10 px-4 py-2.5 text-xs text-red-200"
+          >
+            <span>{importError}</span>
+            <button
+              type="button"
+              onClick={() => setImportError(null)}
+              aria-label="Dismiss import error"
+              className="p-1 text-red-300 hover:text-white cursor-pointer"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
+        {importBanner && !isImporting && (() => {
+          const importedList = importBanner.trackIds
+            .map((id) => tracks.find((t) => t.id === id))
+            .filter((t): t is Track => Boolean(t));
+          const primary = importedList[importedList.length - 1];
+          if (!primary) return null;
+          const isOnA = deckA.trackId === primary.id;
+          const isOnB = deckB.trackId === primary.id;
+
+          return (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="import-confirm-banner"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-sky-400/35 bg-[#111926] px-4 py-3"
+            >
+              <div className="flex items-start gap-2.5 min-w-0">
+                <CheckCircle2
+                  className="mt-0.5 h-4 w-4 shrink-0 text-sky-400"
+                  aria-hidden="true"
+                />
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-semibold text-white">
+                    {importedList.length === 1
+                      ? `Imported “${primary.title}”`
+                      : `Imported ${importedList.length} tracks · Latest: “${primary.title}”`}
+                  </div>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-slate-300">
+                    <span className="font-mono tabular-nums text-sky-300">
+                      {primary.bpm.toFixed(0)} BPM
+                    </span>
+                    <span aria-hidden="true" className="text-slate-600">·</span>
+                    <span className="font-mono tabular-nums">
+                      {formatDuration(primary.duration)}
+                    </span>
+                    <span aria-hidden="true" className="text-slate-600">·</span>
+                    <span>
+                      {importBanner.loadedToDeck
+                        ? persistLocalTracks
+                          ? `Loaded onto Deck ${importBanner.loadedToDeck} & saved locally in this browser`
+                          : `Loaded onto Deck ${importBanner.loadedToDeck} & pinned to Library · Session only (clears on reload)`
+                        : persistLocalTracks
+                          ? 'Pinned to row #1 of Library (Imported) · Saved locally in this browser'
+                          : 'Pinned to row #1 of Library (Imported) · Session only — clears on reload'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleLoadDeck('A', primary.id)}
+                  className={`rounded-md border px-3 py-1.5 font-mono text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                    isOnA
+                      ? 'border-sky-400 bg-sky-500 text-slate-950'
+                      : 'border-sky-400/50 bg-sky-500/15 text-sky-200 hover:bg-sky-500/30'
+                  }`}
+                >
+                  {isOnA ? 'On Deck A' : 'Load Deck A'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleLoadDeck('B', primary.id)}
+                  className={`rounded-md border px-3 py-1.5 font-mono text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                    isOnB
+                      ? 'border-amber-400 bg-amber-500 text-slate-950'
+                      : 'border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/30'
+                  }`}
+                >
+                  {isOnB ? 'On Deck B' : 'Load Deck B'}
+                </button>
+                {!persistLocalTracks && (
+                  <button
+                    type="button"
+                    onClick={() => void handleTogglePersistLocalTracks()}
+                    className="rounded-md border border-amber-400/40 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/20 transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    Remember on reload
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => scrollToSection('library')}
+                  className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/[0.1] hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <span>View in Library</span>
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImportBanner(null)}
+                  aria-label="Dismiss import notice"
+                  className="p-1.5 text-slate-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Parallel Dual-Deck Master Waveform Strip */}
         <section id="console" aria-label="Dual Deck Console" className="flex flex-col gap-4">
           <DualWaveformStrip
@@ -779,12 +1306,18 @@ export default function App() {
               onSync={() => handleSync('A')}
               onSeek={(t) => handleSeek('A', t)}
               onSeekDelta={(d) => handleSeekDelta('A', d)}
+              onScratchStart={() => handleScratchStart('A')}
+              onScratchMove={(r, ms) => handleScratchMove('A', r, ms)}
+              onScratchEnd={() => handleScratchEnd('A')}
+              onToggleVinylMode={() => handleToggleVinylMode('A')}
               onNudge={(f) => audioEngine.setDeckNudge('A', f)}
               onPitchChange={(p) => handlePitchChange('A', p)}
               onTogglePitchRange={() => handleTogglePitchRange('A')}
               onHotCueTrigger={(i) => handleHotCueTrigger('A', i)}
               onHotCueClear={(i) => handleHotCueClear('A', i)}
               onToggleLoop={(b) => handleToggleLoop('A', b)}
+              onDropAudioFiles={(files) => void handleImportFiles(files, 'A')}
+              persistLocalTracks={persistLocalTracks}
             />
 
             <CenterMixer
@@ -814,12 +1347,18 @@ export default function App() {
               onSync={() => handleSync('B')}
               onSeek={(t) => handleSeek('B', t)}
               onSeekDelta={(d) => handleSeekDelta('B', d)}
+              onScratchStart={() => handleScratchStart('B')}
+              onScratchMove={(r, ms) => handleScratchMove('B', r, ms)}
+              onScratchEnd={() => handleScratchEnd('B')}
+              onToggleVinylMode={() => handleToggleVinylMode('B')}
               onNudge={(f) => audioEngine.setDeckNudge('B', f)}
               onPitchChange={(p) => handlePitchChange('B', p)}
               onTogglePitchRange={() => handleTogglePitchRange('B')}
               onHotCueTrigger={(i) => handleHotCueTrigger('B', i)}
               onHotCueClear={(i) => handleHotCueClear('B', i)}
               onToggleLoop={(b) => handleToggleLoop('B', b)}
+              onDropAudioFiles={(files) => void handleImportFiles(files, 'B')}
+              persistLocalTracks={persistLocalTracks}
             />
           </div>
         </section>
@@ -864,16 +1403,25 @@ export default function App() {
           crates={crates}
           activeDeckATrackId={deckA.trackId}
           activeDeckBTrackId={deckB.trackId}
+          recentlyImportedIds={recentlyImportedIds}
+          importVersion={importVersion}
           isImporting={isImporting}
+          importProgress={importProgress}
           importError={importError}
+          persistLocalTracks={persistLocalTracks}
+          savedLocalCount={savedLocalCount}
+          isRestoringSaved={isRestoringSaved}
+          onTogglePersistLocalTracks={() => void handleTogglePersistLocalTracks()}
+          onClearSavedLocalTracks={() => void handleClearSavedLocalTracks()}
           onLoadDeck={handleLoadDeck}
           onToggleFavorite={handleToggleFavorite}
           onCreateCrate={handleCreateCrate}
           onDeleteCrate={handleDeleteCrate}
           onToggleTrackCrate={handleToggleTrackCrate}
           onDeleteTrack={handleDeleteTrack}
-          onImportFiles={handleImportFiles}
+          onImportFiles={(files) => void handleImportFiles(files)}
           onTriggerImport={() => fileInputRef.current?.click()}
+          onTriggerImportFolder={() => folderInputRef.current?.click()}
         />
       </main>
 

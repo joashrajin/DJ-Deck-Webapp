@@ -70,6 +70,7 @@ export interface DeckState {
   loopEnd: number;
   syncLocked: boolean;
   keyLock: boolean;
+  vinylMode: boolean;
 }
 
 export interface FxState {
@@ -97,7 +98,7 @@ export interface Crate {
   isSystem?: boolean;
 }
 
-export type SortField = 'title' | 'artist' | 'bpm' | 'musicalKey' | 'genre' | 'duration';
+export type SortField = 'addedAt' | 'title' | 'artist' | 'bpm' | 'musicalKey' | 'genre' | 'duration';
 export type SortDirection = 'asc' | 'desc';
 
 export type SamplerPadId = 'airhorn' | 'sub-drop' | 'synth-rise' | 'vinyl-stop';
